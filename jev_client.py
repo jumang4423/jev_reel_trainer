@@ -1,11 +1,11 @@
-"""Jev（TypeSafe AI）クライアント — Vercel AI Gateway 経由。
+"""Jev (TypeSafe AI) client — via Vercel AI Gateway.
 
-画像つきの判定は OpenAI 互換 Decisions API（``POST /v1/decisions``）を使う。
-これは Vercel の changelog で画像入力の例が示されている唯一の HTTP 経路。
-素の decision API（``/v1/evaluate``）は state に画像を入れる HTTP 形式が
-公式ドキュメントに無いため、画像ありのときは使わない。
+Image decisions go through the OpenAI-compatible Decisions API (``POST /v1/decisions``).
+That is the only HTTP route Vercel documents with an image-input example.
+The plain decision API (``/v1/evaluate``) has no documented HTTP shape for
+putting images into ``state``, so we do not use it when images are involved.
 
-依存は標準ライブラリのみ（urllib）。リトライと形ゆらぎの吸収だけ自前でやる。
+Standard library only (urllib). Retries and response-shape tolerance are hand-rolled.
 """
 
 from __future__ import annotations
@@ -20,17 +20,17 @@ from typing import Any
 DEFAULT_BASE_URL = os.environ.get("AI_GATEWAY_BASE_URL", "https://ai-gateway.vercel.sh")
 DEFAULT_MODEL = os.environ.get("JEV_MODEL", "typesafe-ai/jev-1.14.0")
 
-# 画像を送れる経路（OpenAI 互換 Decisions API）
+# Route that accepts images (OpenAI-compatible Decisions API)
 IMAGE_PATH = "/v1/decisions"
-# テキストのみの判定経路（decision 用の素の API）
+# Text-only decision route (plain decision API)
 TEXT_PATH = "/v1/evaluate"
 
 
 class JevError(RuntimeError):
-    """Gateway / Jev 側のエラー。
+    """Error raised by the Gateway / Jev.
 
-    ``status`` が入っていれば HTTP ステータス。4xx（429 を除く）は再試行しても
-    無駄なので、呼び出し側は即座に失敗させる。
+    ``status`` holds the HTTP status when available. Retrying 4xx (except 429) is
+    pointless, so the caller fails fast.
     """
 
     def __init__(self, message: str, status: int | None = None):
@@ -43,8 +43,8 @@ class JevError(RuntimeError):
 
 
 def _extra_headers() -> dict[str, str]:
-    """`JEV_EXTRA_HEADERS='{"TypeSafe-Danger-Zone-Images":"true"}'` のような
-    追加ヘッダを環境変数から読む。Gateway が自動で付けてくれる場合は不要。"""
+    """Read extra headers such as `JEV_EXTRA_HEADERS='{"TypeSafe-Danger-Zone-Images":"true"}'`
+    from the environment. Not needed when the Gateway adds them for you."""
     raw = os.environ.get("JEV_EXTRA_HEADERS")
     if not raw:
         return {}
@@ -82,11 +82,11 @@ def decide_with_images(
     timeout: float = 45.0,
     retries: int = 2,
 ) -> dict[str, Any]:
-    """画像つきで Jev を呼ぶ。
+    """Call Jev with images.
 
     Args:
-        text: リールのキャプション等のテキスト state。
-        images_jpeg_b64: base64（data URL の prefix なし）の JPEG。1枚以上。
+        text: text state such as the reel caption.
+        images_jpeg_b64: base64 JPEG (no data-URL prefix). One or more.
         questions: ``[{"type": "predicate", "name": ..., "instructions": ...}, ...]``
     """
     content: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
@@ -119,7 +119,7 @@ def decide_text(
     timeout: float = 45.0,
     retries: int = 1,
 ) -> dict[str, Any]:
-    """テキストのみの判定（画像なし）。questions は ``{id: {...}}`` 形式。"""
+    """Text-only decision (no images). ``questions`` uses the ``{id: {...}}`` form."""
     payload = {"model": model, "state": state, "questions": questions}
     last: Exception | None = None
     for attempt in range(retries + 1):
@@ -133,10 +133,11 @@ def decide_text(
 
 
 def parse_answers(resp: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """answers の形ゆらぎ（list / dict、predicate / boolean）を吸収して
+    """Absorb the various ``answers`` shapes (list / dict, predicate / boolean) and
 
     ``{name: {"probability": float | None, "choice": str | None, "confidence": float | None}}``
-    を返す。確率が素の OpenAI 形式でも TypeSafe 形式でも動くようにしている。
+    return the dict below. Works whether probabilities come in the plain OpenAI shape
+    or the TypeSafe shape.
     """
     result: dict[str, dict[str, Any]] = {}
 
@@ -178,7 +179,7 @@ def parse_answers(resp: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def summarize_usage(resp: dict[str, Any]) -> dict[str, Any]:
-    """ログ用に usage / コストだけ抜き出す（形は経路によって違うので緩く拾う）。"""
+    """Pull just usage / cost for logging (shapes differ per route, so parse loosely)."""
     out: dict[str, Any] = {}
     usage = resp.get("usage")
     if isinstance(usage, dict):

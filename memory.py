@@ -1,12 +1,12 @@
-"""検索クエリと処理済みリールのメモリー（実行をまたいで共有する）。
+"""Memory of search queries and already-processed reels (shared across runs).
 
-狙い: 毎回同じ検索を繰り返さず、**違うタイプの動画**が流れてくるようにする。
-  - `queries.jsonl` : 実行済みクエリの履歴と成果（動物率）
-  - `pending.txt`   : 次に実行するクエリ（エージェントが書く）
-  - `seen_reels.json`: 処理済みリールの shortcode（重複処理を防ぐ）
-  - `THEME_POOL`    : まだ使っていないテーマの候補（エージェントがここから新しいクエリを作る）
+Goal: stop repeating the same search and make **different kinds of video** show up.
+  - `queries.jsonl`  : history of executed queries with their yield (hit rate)
+  - `pending.txt`    : queries queued for the next run (written by the agent)
+  - `seen_reels.json`: shortcodes already processed (prevents duplicates)
+  - `THEME_POOL`     : unused theme candidates the agent picks new queries from
 
-エージェントの役割は「クエリを考えること」、実行と判定はローカル側（crawl.py + local Jev）。
+The agent's job is to *think up queries*; execution and judging happen locally (crawl.py).
 """
 
 from __future__ import annotations
@@ -19,27 +19,28 @@ from pathlib import Path
 DEFAULT_DIR = Path(__file__).resolve().parent / "memory"
 MAX_SEEN_REELS = 5000
 
-# エージェントが新しいクエリを作るためのテーマ候補。
-# カテゴリを散らしてあるので「犬 → 猫 → 昆虫 → 水槽」のように毎回違う方向に振れる。
+# Theme candidates the agent turns into new queries.
+# Spread across categories so each run can pull in a different direction
+# (dogs -> cats -> insects -> aquariums).
 THEME_POOL = [
-    # 犬
+    # dogs
     "puppy", "dog", "dogtok", "dogsofinstagram", "goldenretriever", "shibainu",
     "corgi", "pug", "dachshund", "samoyed",
-    # 猫
+    # cats
     "kitten", "cat", "cattok", "catsofinstagram", "mainecoon", "bengalcat",
-    # 小動物
+    # small pets
     "guineapig", "hamster", "rabbit", "ferret", "chinchilla",
-    # 鳥
+    # birds
     "parrot", "cockatiel", "birdsoftiktok", "duckling", "owl",
-    # 野生
+    # wildlife
     "wildlife", "fox", "deer", "squirrel", "hedgehog", "raccoon",
-    # 昆虫（"weird bugs" 系）
+    # insects (the "weird bugs" bucket)
     "insects", "beetle", "mantis", "jumping spider", "moth", "snail",
-    # 水棲・爬虫類
+    # aquatic & reptiles
     "aquarium", "koi", "bettafish", "gecko", "turtle", "axolotl",
-    # 牧場・大型
+    # farm & large animals
     "horses", "goats", "cows", "sheep", "piglet", "alpaca",
-    # 横断
+    # cross-cutting
     "cute animals", "funny animals", "animal rescue", "baby animals", "animal friendship",
 ]
 
@@ -98,7 +99,7 @@ class Memory:
         return [l.strip() for l in self.pending_file.read_text(encoding="utf-8").splitlines() if l.strip()]
 
     def add_pending(self, queries: list[str]) -> tuple[list[str], list[str]]:
-        """追加。戻り値は (追加した, 既に履歴にあって弾いた)。"""
+        """Append. Returns (added, skipped_because_already_seen)."""
         have = self.used_queries() | set(self.pending())
         added, skipped = [], []
         for q in queries:
@@ -140,7 +141,7 @@ class Memory:
             return
         seen = self.seen_reels()
         seen.update(codes)
-        if len(seen) > MAX_SEEN_REELS:  # 古いものから捨てる（JSON 配列なので順序はおおよそ挿入順）
+        if len(seen) > MAX_SEEN_REELS:  # Drop the oldest (JSON array, so order is roughly insertion order)
             seen = set(list(seen)[-MAX_SEEN_REELS:])
         self.reels_file.write_text(json.dumps(sorted(seen)), encoding="utf-8")
 
@@ -150,7 +151,7 @@ class Memory:
             fh.write(json.dumps({"ts": _now(), "queries": queries, **summary}, ensure_ascii=False) + "\n")
 
     def unused_themes(self, limit: int = 40) -> list[str]:
-        """まだクエリに使っていないテーマ候補（エージェントが次に選ぶためのヒント）。"""
+        """Theme candidates not used in any query yet (hints for the agent's next pick)."""
         used_blob = " ".join(self.used_queries()).lower() + " " + " ".join(self.pending()).lower()
         return [t for t in THEME_POOL if t.lower() not in used_blob][:limit]
 

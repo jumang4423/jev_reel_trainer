@@ -1,15 +1,17 @@
-"""リールの発見（シード収穫）。
+"""Reel discovery (seed harvesting).
 
-実機検証で分かったこと:
-  - HTTP での検索エンジン収穫は使えない（DuckDuckGo はすぐレート制限、Bing は site: を無視、
-    Reddit は 403）。**実ブラウザでの検索が唯一安定して動く**。
-  - IG のタグページ（/explore/tags/...）は Web では壊れている（クリックでも直リンクでも
-    /explore/search/keyword/?q=... に化けて "Something went wrong"）。
-  - 検索エンジンで `site:instagram.com reel <keyword>` を引くと、実在の犬リールの URL が取れる。
-  - パーマリンク（/reel/<code>/）は、ログイン済みの実ブラウザなら普通に開いて再生できる。
+Findings from testing on the real browser:
+  - Harvesting search engines over plain HTTP does not work (DuckDuckGo rate-limits
+    almost immediately, Bing ignores `site:`, Reddit returns 403).
+    **Searching from the real browser is the only reliable route.**
+  - Instagram tag pages (/explore/tags/...) are broken on the web: clicking a hashtag or
+    opening the URL directly both rewrite to
+    /explore/search/keyword/?q=... which renders "Something went wrong".
+  - `site:instagram.com reel <keyword>` on a search engine returns real reel URLs.
+  - Reel permalinks (/reel/<code>/) open and play normally in a logged-in real browser.
 
-したがって「ランダム生成」ではなく **検索エンジンのインデックス → 実在 URL** を種にして、
-そこから **投稿者プロフィールを辿って** 供給を増やす。
+So instead of generating random URLs, we seed from **search-engine hits -> real URLs** and then
+grow the supply by **walking the author's profile**.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import urllib.parse
 REEL_CODE_RE = re.compile(r"instagram\.com/(?:reel|reels)/([A-Za-z0-9_-]{6,})")
 HASHTAG_RE = re.compile(r"#([0-9A-Za-z_\u3040-\u30ff\u4e00-\u9fff]{2,40})")
 
-# 実測でブロックされなかったエンジン（実ブラウザで開く前提）
+# Engines that did not block us (opened in the real browser)
 SEARCH_ENGINES = {
     "brave": "https://search.brave.com/search?q={q}",
     "google": "https://www.google.com/search?q={q}&num=30",
@@ -39,7 +41,7 @@ JS_HREFS = "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.ge
 
 
 def harvest_search(page, query: str, engine: str = "brave", wait_ms: int = 2600) -> list[str]:
-    """検索エンジン経由で実在のリール shortcode を集める（実ブラウザで実行）。"""
+    """Collect shortcodes of real reels via a search engine (runs in the real browser)."""
     tpl = SEARCH_ENGINES.get(engine)
     if not tpl:
         raise ValueError(f"unknown engine: {engine}")
@@ -59,7 +61,7 @@ def harvest_search(page, query: str, engine: str = "brave", wait_ms: int = 2600)
 
 
 def profile_reel_codes(page, username: str, scrolls: int = 3, wait_ms: int = 2200) -> list[str]:
-    """投稿者のプロフィールから、その人のリール shortcode を集める。"""
+    """Collect reel shortcodes from an author's profile page."""
     page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded")
     try:
         page.wait_for_load_state("networkidle", timeout=12000)
@@ -79,7 +81,7 @@ def profile_reel_codes(page, username: str, scrolls: int = 3, wait_ms: int = 220
 
 
 def split_author_and_caption(text: str) -> tuple[str, str]:
-    """``reel_text()`` の戻り（"author • Follow caption..."）を分解する。"""
+    """Split the output of ``reel_text()`` ("author • Follow caption...") into parts."""
     if not text:
         return "", ""
     head = text.split("•", 1)[0].strip()

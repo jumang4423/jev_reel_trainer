@@ -1,255 +1,226 @@
 # jev_reel_trainer
 
-Instagram のリールを無限にスクロールし、各リールの 1 フレームを
-**TypeSafe Jev**（Vercel AI Gateway）に判定させて、対象（既定は犬・猫）なら
-**Like**、それ以外はスキップ（任意で「I just don't like it」）する自動化。
+Train an Instagram Reels feed toward chosen content (dogs, cats, other animals) **without
+following, reposting, commenting, DM-ing or saving** — by watching reels on your behalf and
+judging each frame with a Jev-style decision engine.
 
-判定を LLM の文章パースではなく **Jev の型付き確率**で行うのが狙い。
-`experimental` ではなく、確率と確信度がそのまま返るので、しきい値で機械的に
-扱える（＝「賢い if 文」をフィード訓練ループに埋め込む）。
+Two judging engines are available:
 
-## 構成
+| `--judge` | What it is | Cost |
+|---|---|---|
+| `none` | No judging at all. The search query already guarantees the topic. | free, no model, fastest |
+| `local` | A small VLM (Qwen3-VL-4B) under llama.cpp, read out as typed probabilities | free, on-device |
+| `jev` | TypeSafe Jev on Vercel AI Gateway | paid (not free-tier eligible) |
+
+## Why this exists
+
+Passive scrolling cannot create a new interest. Reels are sourced from *accounts you follow*
+plus *reels similar to ones you recently engaged with*, so a tech-only feed never surfaces a dog.
+Worse, a naive loop that advances after a fixed delay teaches "low interest" on everything.
+
+This tool attacks that in two ways:
+
+1. **Builds its own supply** — harvests real reel URLs through a search engine, watches them,
+   then walks the authors' profiles to grow the pool (`crawl.py`).
+2. **Sends only private signals** — watch time is Mosseri's #1 ranking signal and it notifies
+   nobody, saves nothing and pollutes no list. Non-targets are cut in under two seconds, which
+   Meta's own Reels system card explicitly models as a negative signal.
+
+## Layout
 
 ```
-SKILL.md          エージェント向けスキル定義（このリポジトリを skill として実行する）
-jev_client.py     Jev（クラウド）呼び出し — Vercel AI Gateway / 画像対応 / リトライ
-local_judge.py    ローカル VLM を Jev 風に使う判定（llama.cpp の 1 トークン logprobs 読み出し）
-discover.py       リールの発見 — 検索エンジン収穫（実ブラウザ）とプロフィール巡回
-crawl.py          フィードに依存せず供給を作るモード＋メモリー連携
-memory.py         検索クエリ／処理済みリールのメモリー（実行をまたいで重複を防ぐ）
-reel_trainer.py   リールフィードを回して訓練するループ本体
-serve_local.sh    ローカル判定サーバの起動
+SKILL.md             agent-facing skill definition (run this repo as a skill)
+reel_trainer.py      the feed loop (watch-to-completion / instant skip, small-post-only likes)
+crawl.py             feed-independent supply building (search -> watch -> author profiles)
+discover.py          seed harvesting via a search engine + author profile walking
+local_judge.py       local VLM used like Jev (single-token logprob readout)
+jev_client.py        cloud Jev (Vercel AI Gateway, OpenAI-compatible Decisions API)
+memory.py            query and processed-reel memory (so each run uses different themes)
+serve_local.sh       start the local judge server
 requirements.txt
 .env.example
 ```
 
-## セットアップ
+## Setup
 
 ```bash
 cd jev_reel_trainer
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m playwright install chromium   # 同梱 Chromium（Brave/Chrome があれば実質不要）
-
-cp .env.example .env
-# .env の AI_GATEWAY_API_KEY を埋める（Vercel > AI Gateway > API Keys）
+cp .env.example .env      # only needed for --judge jev
 ```
 
-`AI_GATEWAY_API_KEY` は moshi シェルに読み込んでから実行する：
+### Attach to your real, logged-in Brave (recommended)
+
+Chrome / Brave / Edge **136 and later ignore `--remote-debugging-port` for the default
+profile**, so a fresh profile would mean logging in again. The extension route
+(`playwright-ext`) cannot be used from a standalone Python process either. The working route is
+Brave's **authorized remote debugging**:
+
+1. Open `brave://inspect/#remote-debugging` in Brave and turn on **Allow remote debugging**.
+   The choice is stored in `Local State` and survives restarts.
+2. Run with `--cdp`. Each connection may show an approval prompt in Brave — click allow.
+
+`--cdp` reads `DevToolsActivePort` from the profile and connects over `ws://`. HTTP discovery
+(`/json/version`) returns 404 on that route; Playwright can still attach over `ws://`.
+
+Your open tabs are never touched (a new tab is used) and the browser is never closed.
+
+### Alternative: a dedicated profile
+
+Without `--cdp`, a dedicated profile (`.browser-profile/`) is launched and you log in to
+Instagram once. It is gitignored.
+
+## Local judge (free, on-device)
 
 ```bash
-export $(grep -v '^#' .env | xargs)
-```
-
-## 判定エンジンは 2 つ（クラウド Jev / ローカル VLM）
-
-| `--judge` | 実体 | 費用 | 備考 |
-|---|---|---|---|
-| `jev`（既定） | Vercel AI Gateway の `typesafe-ai/jev-1.14.0` | **有料**（無料枠対象外。$0.042/1M 入力） | 本家。最も正確・最速・最安（有料の中では） |
-| `local` | llama.cpp + 小型 VLM（Qwen3-VL-4B） | **無料・完全ローカル** | 通信なし。精度は落ちる |
-
-### ローカル判定の仕組み（`local_judge.py`）
-
-Jev と同じ「型付きの判断を確率で返す」を、**テキストを生成せずに**実現する：
-
-1. 画像＋文脈＋「取れるラベル一覧（dog/cat/other/none）」を 1 プロンプトにする
-2. `max_tokens=1, temperature=0, logprobs=true, top_logprobs=20` で**1 トークンだけ**生成
-3. その位置の分布からラベルの確率を読む（無いラベルには下限を敷いて正規化）
-4. `dog`/`cat`/`other`/`none` を Jev 互換の `is_dog` / `is_cat` / `is_animal` に変換
-
-自由文の生成もパースも無いので、スキーマ外れが起きません。
-
-### ローカルの起動
-
-```bash
-# モデル（Apache-2.0, 約 3.4 GB）
 huggingface-cli download Qwen/Qwen3-VL-4B-Instruct-GGUF \
   --include "Qwen3VL-4B-Instruct-Q4_K_M.gguf" "mmproj-Qwen3VL-4B-Instruct-F16.gguf" \
   --local-dir ~/models/Qwen3-VL-4B-Instruct-GGUF
 
-# llama-server を起動（Metal、ポート 8081）
-./serve_local.sh
-
-# 動作確認（1 枚の画像を判定）
+./serve_local.sh                                  # llama-server on :8081 (Metal)
 .venv/bin/python local_judge.py --health
-.venv/bin/python local_judge.py --image /path/to/frame.jpg --context "caption..."
-
-# リールのループをローカル判定で回す（API キー不要）
-.venv/bin/python reel_trainer.py --cdp --judge local
+.venv/bin/python local_judge.py --image frame.jpg --context "caption text"
 ```
 
-モデルを差し替えるときは `MODEL_DIR` / `MODEL_FILE` / `MMPROJ_FILE` を環境変数で指定する。
-M1 Pro / 16 GB なら 4B クラス（Qwen3-VL-4B, Gemma 3 4B, Qwen3.5-4B, SmolVLM2-2.2B, Moondream2）が現実的。
+The model weights (~3.1 GB) are **not** committed and must be downloaded separately.
+Note that `huggingface-cli` also fills `~/.cache/huggingface/xet`; removing only `~/models`
+leaves ~3 GB behind.
 
-## 供給を作る（crawl）＋メモリー
+How it works, in brief:
 
-フィードは「フォロー中＋最近反応したリールに似たもの」から候補を集めるため、
-反応が全部テックだと**動物は永久に来ません**。そこでフィードに依存しない入口を使う。
+1. Image + context + the allowed label list become one prompt.
+2. Exactly one token is generated (`max_tokens=1, temperature=0, logprobs=true, top_logprobs=N`).
+3. Label probabilities are read from the distribution at that position.
+4. Labels that never appeared get a floor value, then everything is renormalized.
+
+No free-form generation, no parsing — the local equivalent of Jev's `choice` / `noul`.
+
+## Building supply (`crawl.py`) + memory
 
 ```bash
-# 1. メモリーを見る（使ったテーマ・未使用テーマ・pending・処理済み数）
+# 1. inspect memory (used themes, unused themes, pending, processed reels)
 .venv/bin/python crawl.py --plan
 
-# 2. 未使用テーマから選んでクエリを積む（テーマを散らす）
+# 2. queue fresh queries, spreading across categories
 .venv/bin/python crawl.py \
   --add-query "site:instagram.com reel corgi" \
   --add-query "site:instagram.com reel jumping spider"
 
-# 3. 実行（判定はローカル Jev。20分で自動終了）
-.venv/bin/python crawl.py --cdp --judge local --interact like --session-minutes 20
+# 3. run it (20 minute session cap, likes on small posts only)
+.venv/bin/python crawl.py --cdp --judge none --interact like --session-minutes 20
 ```
 
-やっていること:
+What it does:
 
-1. **検索エンジン（実ブラウザ）で実在のリール URL を収穫** — タグページは Web では壊れており、
-   HTTP 収穫も全滅するので、これが唯一安定する入口
-2. 各リールを開いて **ローカル Jev で判定**
-3. 対象なら **最後まで視聴（＋ループ）**、投稿者とハッシュタグを収穫
-   → **投稿者プロフィールを次に回す**（犬アカウントなら全部犬）
-4. 対象外なら**すぐ離れる**（無駄な視聴をしない）
-5. `--report-every` 本ごとに**動物ヒット率**を表示
+1. **Harvests real reel URLs through a search engine** in the real browser — tag pages are
+   broken on the web and plain-HTTP harvesting fails outright, so this is the only stable entry.
+2. Opens each reel and (optionally) judges it.
+3. For targets: **watches to the end (+ loops)**, harvests the author and hashtags, and queues the
+   **author's profile** for expansion (a dog account is all dogs).
+4. For non-targets: leaves immediately — no wasted watch time.
+5. Prints the hit rate every `--report-every` reels.
 
-### メモリー（`memory/`、gitignore 済み）
+### Memory (`memory/`, gitignored)
 
-| ファイル | 役割 |
+| File | Purpose |
 |---|---|
-| `queries.jsonl` | 実行済みクエリと成果（`found`/`processed`/`animal_rate_pct`） |
-| `pending.txt` | 次に実行するクエリ |
-| `seen_reels.json` | 処理済みリール（**実行をまたいで重複を防ぐ**） |
-| `runs.jsonl` | 実行ごとのサマリー |
+| `queries.jsonl` | executed queries with their yield (`found` / `processed` / `animal_rate_pct`) |
+| `pending.txt` | queries queued for the next run |
+| `seen_reels.json` | processed reel shortcodes (**prevents duplicates across runs**) |
+| `runs.jsonl` | per-run summaries |
 
-履歴にあるクエリは既定でスキップ（`--allow-repeat` で解除）。
-**エージェントが `--plan` を見て毎回違うクエリを考える**ことで、
-「puppy → speedy cat → weird bugs」のように多様な内容が流れる。
+Queries already in history are skipped (`--allow-repeat` overrides).
+The agent reads `--plan`, picks unused themes and queues new queries, so each run pulls in a
+different direction — dogs, then cats, then insects.
 
-### Like ポリシー
+### Like policy
 
-IG のリールは**いいね数を表示しない**ので、**コメント数とリポスト数**で判定する。
-`--interact like` のときだけ、**両方が閾値以下（既定 50）の投稿のみ** Like する。
-フォロー / リポスト / コメント / DM / 保存は**実装していない**。
+IG does not display a like count on reels, so the gate uses **comment and repost counts**.
+With `--interact like`, a reel is liked only when **both** are at or below their thresholds
+(default 50). Follow / repost / comment / DM / save are **not implemented at all**.
 
-## 既存の Brave セッションを使う（推奨・ログイン不要）
-
-Chrome / Brave / Edge は **136 以降、既定プロファイルへの `--remote-debugging-port` を
-無視する**（Cookie 窃取対策）。`playwright-ext` の拡張機能モードは CDP を使わないので
-この制限を回避しているが、**Python からはそのセッションを直接使えない**。
-
-代わりに **「認可付きリモートデバッグ」** を使う。あなたの Brave（Chromium 154 相当）なら
-これが使える:
-
-1. Brave のアドレスバーで `brave://inspect/#remote-debugging` を開き、
-   **「Allow remote debugging」を ON** にする（一度だけ。`Local State` に保存され、再起動後も有効）
-2. 実行する:
+## Running the feed loop
 
 ```bash
-.venv/bin/python reel_trainer.py --cdp --probe
+.venv/bin/python reel_trainer.py --cdp --judge local          # scroll the feed you have
+.venv/bin/python reel_trainer.py --cdp --judge none --steps 50
 ```
 
-- `--cdp`（= `auto`）はプロファイル直下の `DevToolsActivePort` を読み、
-  `ws://127.0.0.1:<port><path>` に接続する。この経路は HTTP の `/json/version` が
-  404 になるが、**Playwright は `ws://` に直接接続できる**ので問題ない（検証済み）。
-- **接続時に Brave に承認ダイアログが出るので「許可」を押す**（1 実行につき 1 回）。
-- **あなたの開いているタブは触らない**（新しいタブを 1 枚作って使う）。終了時もブラウザは閉じない。
-- 明示指定もできる: `--cdp ws://127.0.0.1:9222/devtools/browser/<uuid>`
-
-## 代替: 専用プロファイル（初回だけ手動ログイン）
-
-`--cdp` を使わない場合は、専用プロファイル（`.browser-profile/`）で Brave が起動する。
-この場合は Instagram に一度手動ログインが必要（Cookie は以後残る）。プロファイルは
-リポジトリに含めない（.gitignore 済み）。
-
-```bash
-.venv/bin/python reel_trainer.py --probe
-```
-
-## 実行
-
-```bash
-# 無限ループ（既定）。犬・猫なら Like、それ以外はスキップ
-python reel_trainer.py
-
-# 20 本だけ、ネガティブは Report -> I just don't like it
-python reel_trainer.py --steps 20 --negative report
-
-# 全動物を対象にする
-python reel_trainer.py --targets any --threshold 0.85
-
-# フレームを保存しつつ様子見
-python reel_trainer.py --frames-dir frames/ --steps 10
-```
-
-主なオプション：
-
-| オプション | 既定 | 意味 |
+| Option | Default | Meaning |
 |---|---|---|
-| `--steps` | `0` | 処理するリール数。`0` は無限 |
-| `--cdp [URL]` | なし | 既存ブラウザに CDP 接続（ログイン不要）。`--cdp` だけで `auto` 検出 |
-| `--targets` | `dog,cat` | Like する対象。`any` で全動物 |
-| `--threshold` | `0.90` | Like を押す確率しきい値 |
-| `--negative` | `skip` | 対象外のときの挙動。`report` で Report→「I just don't like it」 |
-| `--max-reports` | `30` | 1 実行あたりの report 操作上限 |
-| `--max-likes-per-hour` | `120` | Like のレート制限 |
-| `--min-delay` / `--max-delay` | `2.5` / `7.0` | 次リールまでの待機秒（ランダム） |
-| `--dry-run` | off | 判定も操作もせずループだけ回す |
-| `--probe` | off | 1 本だけ判定して詳細表示 |
-| `--log` | `runs/reels.jsonl` | 判定・行動の JSONL ログ |
+| `--steps` | `0` | reels to process; `0` loops forever |
+| `--cdp [URL]` | off | attach to the running browser (`--cdp` alone means auto-discovery) |
+| `--judge` | `local` | `none` / `local` / `jev` |
+| `--interact` | `view-only` | `like` enables the small-post like gate |
+| `--loops` | `1` | extra loops watched on target reels |
+| `--max-dwell` | `45.0` | max watch seconds per reel |
+| `--dry-run` / `--probe` | off | exercise the loop / judge one reel and print details |
 
-## Jev への質問
+## Jev questions
 
-1 リクエストで 3 つを**並列**評価する（`POST https://ai-gateway.vercel.sh/v1/decisions`）：
+Three predicates are asked in a single request
+(`POST https://ai-gateway.vercel.sh/v1/decisions`):
 
 ```json
 {
   "model": "typesafe-ai/jev-1.14.0",
   "input": [{"role": "user", "content": [
-    {"type": "input_text", "text": "Instagram のリール…キャプション: ..."},
+    {"type": "input_text", "text": "Instagram reel frame. Caption: ..."},
     {"type": "input_image", "image_url": "data:image/jpeg;base64,..."}
   ]}],
   "questions": [
-    {"type": "predicate", "name": "is_dog", "instructions": "画像にはっきりと犬が写っていますか？"},
-    {"type": "predicate", "name": "is_cat", "instructions": "画像にはっきりと猫が写っていますか？"}
+    {"type": "predicate", "name": "is_dog", "instructions": "Does the image clearly show a dog?"},
+    {"type": "predicate", "name": "is_cat", "instructions": "Does the image clearly show a cat?"}
   ]
 }
 ```
 
-`--targets any` のときだけ `is_animal` も足す。確率 `>= --threshold` なら Like。
+## Instagram web quirks (all verified on a real profile)
 
-## 実機で判明した Instagram Web リールのクセ（この実装の根拠）
+1. **A background tab never decodes `<video>`.** Full-page screenshots come out solid grey;
+   `page.bring_to_front()` is mandatory.
+2. **Clicking the video element navigates to the permalink** and turns the `...` menu into the
+   post menu. Never click the video — bring the tab forward and muted-play instead.
+3. **Tag pages are broken on the web.** `/explore/tags/<tag>/` rewrites to
+   `/explore/search/keyword/?q=...` and renders "Something went wrong", whether clicked or
+   opened directly. Hashtag crawling is impossible.
+4. **Plain-HTTP search harvesting does not work.** DuckDuckGo rate-limits almost immediately,
+   Bing ignores `site:`, Reddit returns 403. The real browser is the only reliable route.
+5. **Keyword search returns accounts, not content** ("puppy" surfaces DJs and people).
+   `site:instagram.com reel <keyword>` is far better.
+6. **An already-liked reel flips `aria-label` to `Unlike`** — used to avoid double taps and to
+   verify the action landed.
+7. **The web reel `...` menu has no "Not interested"** (only Report / Go to post / Share to... /
+   Copy link / Embed / About this account).
+8. **`Your Algorithm` and `Reset suggested content` are mobile-only.** They are free, harmless
+   and the strongest levers, so asking the user for three taps on their phone is worthwhile.
 
-1. **背景タブだと `<video>` がデコードされない。** ページ全体のスクショは
-   グレー一色になる。`page.bring_to_front()` が必須。
-2. **動画要素をクリックするとパーマリンク（`/reels/<code>/`）に遷移し、
-   `...` メニューが「投稿メニュー」に化ける。** よって動画は絶対にクリックしない。
-   前面化 + `video.muted = true; video.play()` でデコードさせる。
-3. **要素スクショより canvas の `drawImage` のほうが良い。** 要素スクショには
-   再生ボタンのオーバーレイが乗ることがある。
-4. **Web 版リールの `...` に「Not interested」は無い。**
-   実際の中身は `Report / Go to post / Share to... / Copy link / Embed / About this account`。
-   準ネガティブは `Report` →「I just don't like it」（既定はオフ）。
-5. **Like 済みは `aria-label` が `Unlike` に変わる。** これを二重押し防止と
-   操作成功の検証に使う。
+## Measured numbers
 
-## 既知の制約
+| Path | On-target rate |
+|---|---|
+| Reel feed (tech-heavy account) | 0–2% |
+| **Search-engine seeds** | **100% (12/12)** |
+| Local judge on a dog reel | `dog = 1.00` |
+| Local judge on a katydid | `animal = 0.9999` |
+| Local judge on people / a PCB | `none = 0.9999` |
+| Local judge latency | 4.6–7.6 s (M1 Pro / Metal, image encoding included) — ~6–7 s of *prefill*, generation is 0 ms |
 
-- **Jev は AI Gateway の無料枠では使えない（実測）。** Hobby の月 $5 無料クレジットを
-  持っていても `typesafe-ai/jev*` は対象外で、画像つきの判定は
-  `HTTP 403 / no_providers_available（Free tier users do not have access to this model）`
-  になる。**AI Gateway のクレジット購入（有料 tier 化）が必須**。
-  なお無料枠の対象モデルに vision 対応モデルは 1 つも無いため、無料のままでは
-  画像判定はどのモデルでもできない。
-- **Jev の画像入力は実験的機能**（TypeSafe のプレビュー）。精度はテキストより落ちる。
-  1 フレームだけで判定するので、動画の途中にしか動物が出ないリールは取りこぼす。
-  必要なら `--frames-dir` で複数フレームを保存し、複数枚を同時に送る拡張が効く。
-- **動画・音声は送れない**（Jev は静止画のみ）。キャプションはテキストで渡している。
-- **`Not interested` が無い**ため、ネガティブ信号は実質「Report → I just don't like it」か
-  「即スキップ（滞在時間）」しかない。
-- **Like の上限**は Instagram 側の制限がある。`--max-likes-per-hour` を守ること。
-- 自動操作は **Instagram の利用規約に触れる可能性**がある。自己責任で。
+Because search seeds measured 100% on-target, `--judge none` is the sensible default for
+crawling; keep a judge only for the feed loop and for measurement (`--sample-judge`).
 
-## 次の拡張（推奨）
+## Known limitations
 
-- **確信度フォールバック**：Jev の確信度が低いときだけ vision LLM
-  （例 `google/gemini-3.7-flash`、`openai/gpt-6-luna`）で再判定する。
-  `providerMetadata.typesafe.confidence` を読めば分岐できる。
-- **複数フレーム**：`--frames-dir` を利用し、3 枚程度をまとめて 1 リクエストで送る。
-- **判定の記録と評価**：`runs/reels.jsonl` をラベル付けして精度を測る。
+- **Jev is not free-tier eligible.** With a Hobby account the monthly $5 credit does not cover
+  `typesafe-ai/jev*`; the API returns `403 no_providers_available`. AI Gateway credits are
+  required. No free-tier model supports vision, so image judging always costs money on Gateway.
+- **Jev's image input is an experimental TypeSafe feature**; accuracy is worse than on text.
+- **Nothing is guaranteed.** With no follows, only watch time and occasional likes are sent, so
+  expect **days to weeks** of repeated sessions. Judgement comes from the `animal_rate_pct`
+  trend in `runs/`.
+- **The browser tab is brought to the front** while running (needed to decode video), so run it
+  when you are not using the browser.
+- **Keep search-engine queries to 3–6 per session**, and cap author profile walks with
+  `--max-profiles`, to stay clear of bot detection.
+- Automation may violate Instagram's terms. Use at your own risk and respect the rate limits.

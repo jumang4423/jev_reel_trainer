@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""jev_reel_trainer — Instagram リールを無限スクロールし、各リールのフレームを
-TypeSafe Jev（Vercel AI Gateway）に判定させ、対象（既定は犬・猫）なら Like、
-それ以外はスキップ（任意で「I just don't like it」）する。
+"""jev_reel_trainer — scroll Instagram Reels and have each reel judged, then
+like the ones you want (dogs/cats by default) and skip the rest.
 
-この実装は実機検証（あなたの Brave を Playwright で操作）で判明した
-Instagram Web リールのクセを織り込んでいる:
+This implementation bakes in the Instagram web quirks found by testing on a
+real Brave profile:
 
-  1. 背景タブだと <video> がデコードされない
-     -> page.bring_to_front() が必須。ページ全体のスクショはグレー一色になる。
-  2. 動画要素をクリックするとパーマリンク（/reels/<code>/）に遷移し、
-     `...` メニューが「投稿メニュー」に変わってしまう
-     -> 動画は絶対にクリックしない。前面化＋ミュート play() でデコードさせる。
-  3. 要素スクショより canvas へ drawImage したほうがオーバーレイ（再生ボタン）が乗らない
-     -> フレーム取得は canvas -> dataURL。
-  4. Web 版リールの `...` には "Not interested" が無い
-     （Report / Go to post / Share to... / Copy link / Embed / About this account のみ）
-     -> 準ネガティブは Report -> "I just don't like it"（既定はオフ、--negative report）。
-  5. Like 済みは aria-label が "Unlike" に変わる
-     -> 二重押し防止と操作の検証にこれを使う。
+  1. A background tab never decodes <video>.
+     -> page.bring_to_front() is mandatory; a full-page screenshot is solid grey.
+  2. Clicking the video element navigates to the permalink (/reels/<code>/) and the
+     `...` menu turns into the post menu.
+     -> Never click the video; bring the tab forward and muted play() to decode it.
+  3. drawImage into a canvas avoids the play-button overlay that an element
+     screenshot would include.
+     -> Frames are captured via canvas -> dataURL.
+  4. The web reel `...` menu has no "Not interested"
+     (only Report / Go to post / Share to... / Copy link / Embed / About this account).
+     -> The nearest negative is Report -> "I just don't like it" (off by default, --negative report).
+  5. An already-liked reel flips aria-label to "Unlike".
+     -> Used to avoid double taps and to verify the action landed.
 
-注意: 自動操作は Instagram の利用規約に触れる可能性がある。自己責任で、かつ
-レート制限（--min-delay / --max-delay / --max-likes-per-hour）を守って使うこと。
+Warning: automation may violate Instagram's terms. Use at your own risk and respect
+the rate limits (--min-delay / --max-delay / --max-likes-per-hour).
 """
 
 from __future__ import annotations
@@ -41,25 +41,25 @@ from pathlib import Path
 try:
     from PIL import Image
 except ImportError:  # pragma: no cover
-    sys.exit("Pillow が必要です: pip install -r requirements.txt")
+    sys.exit("Pillow is required: pip install -r requirements.txt")
 
 try:
     from playwright.sync_api import TimeoutError as PWTimeout
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover
-    sys.exit("Playwright が必要です: pip install -r requirements.txt && python -m playwright install")
+    sys.exit("Playwright is required: pip install -r requirements.txt && python -m playwright install")
 
 from jev_client import DEFAULT_MODEL, JevError, decide_with_images, parse_answers, summarize_usage
 
-try:  # Pillow 10 以降でも古くても動くように
+try:  # works on Pillow 10+ and older releases
     RESAMPLE = Image.Resampling.LANCZOS
 except AttributeError:  # pragma: no cover
     RESAMPLE = Image.LANCZOS
 
 # --------------------------------------------------------------------------
-# Jev の画像制限（TypeSafe docs）
-#   PNG/JPEG のみ / 1ファイル 16MiB / 各辺 280〜1568px /
-#   総画素数 78,400〜2,458,624 / リクエスト全体 32MiB
+# Jev image limits (from TypeSafe docs)
+#   PNG/JPEG only / 16MiB per file / 280-1568px per side /
+#   78,400-2,458,624 total pixels / 32MiB per whole request
 # --------------------------------------------------------------------------
 MAX_SIDE = 1568
 MIN_SIDE = 280
@@ -71,9 +71,9 @@ BROWSER_CANDIDATES = [
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
 ]
 
-# 既存ブラウザのプロファイル（DevToolsActivePort を探す場所）。
-# Brave/Chrome/Edge ≧136 では既定プロファイルに --remote-debugging-port が効かないため、
-# brave://inspect のトグルで有効化した「認可付きリモートデバッグ」を使う。
+# Profiles of running browsers (where to look for DevToolsActivePort).
+# Brave/Chrome/Edge >= 136 ignore --remote-debugging-port for the default profile, so we
+# use the authorized remote debugging enabled by the brave://inspect toggle.
 DEFAULT_PROFILE_DIRS = [
     "~/Library/Application Support/BraveSoftware/Brave-Browser",
     "~/Library/Application Support/Google/Chrome",
@@ -81,7 +81,7 @@ DEFAULT_PROFILE_DIRS = [
 ]
 
 # --------------------------------------------------------------------------
-# ページ内で実行する JS（文字列で持つ。f-string と波括弧が衝突しないように）
+# JS executed inside the page (kept as strings so braces never clash with f-strings)
 # --------------------------------------------------------------------------
 JS_READY = """() => {
   const H = window.innerHeight;
@@ -106,7 +106,7 @@ JS_PLAY = """() => {
   return true;
 }"""
 
-# 現在ビューポートに出ているリールのフレームを canvas 経由で取り出す
+# Grab the frame of the reel currently in the viewport via canvas
 JS_FRAME = """() => {
   const H = window.innerHeight;
   let best = null;
@@ -125,10 +125,10 @@ JS_FRAME = """() => {
   return c.toDataURL('image/jpeg', 0.9);
 }"""
 
-# 現在のリールの作者名・キャプション。
-# 注: IG のリールはキャプションが <a> でも動画の祖先でもなく、オーバーレイの
-#     div/span として描画される。ビューポート内で「短い高さのまま最も長い
-#     テキストを持つコンテナ」を選ぶと作者＋キャプションが取れる（実測で確認）。
+# Author and caption of the current reel.
+# Note: an IG reel caption is neither an <a> nor an ancestor of the video; it is
+#     drawn as overlay divs/spans. Picking the container that stays short while
+#     holding the longest text yields author+caption (verified by measurement).
 JS_REEL_TEXT = """() => {
   const H = window.innerHeight;
   let best = '';
@@ -137,13 +137,13 @@ JS_REEL_TEXT = """() => {
     if (t.length < 12 || t.length > 400 || t.length <= best.length) return;
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.top < 0 || r.bottom > H) return;
-    if (r.height > 300 || r.width > 900) return;   // フィード全体を掴まない
+    if (r.height > 300 || r.width > 900) return;   // do not grab the whole feed
     best = t;
   });
   return best.slice(0, 400);
 }"""
 
-# ビューポート内にあるボタン（svg[aria-label=...]）の中心座標を返す
+# Return the center of the first in-viewport button with a matching svg[aria-label]
 JS_BUTTON = """(label) => {
   const H = window.innerHeight;
   const out = [];
@@ -165,7 +165,7 @@ JS_HAS_LABEL = """(label) => {
   });
 }"""
 
-# 現在表示中のリール動画の長さ・再生位置（完走判定に使う）
+# Duration and playback position of the on-screen video (used to judge completion)
 JS_VIDEO_INFO = """() => {
   const H = window.innerHeight;
   let best = null;
@@ -179,8 +179,8 @@ JS_VIDEO_INFO = """() => {
   return best;
 }"""
 
-# アクションバーの数値（コメント数・リポスト数）。
-# 注: IG のリールは「いいね数」を表示しない。表示されるのは comment と repost のみ。
+# Action-bar counters (comment and repost counts).
+# Note: IG does not display a like count on reels; only comment and repost are shown.
 JS_ENGAGEMENT = """() => {
   const H = window.innerHeight;
   const labelY = {};
@@ -215,19 +215,19 @@ JS_ENGAGEMENT = """() => {
 
 
 # --------------------------------------------------------------------------
-# 画像の正規化（Jev の制限に収める）
+# Normalize an image so it fits Jev's limits
 # --------------------------------------------------------------------------
 def normalize_for_jev(img: "Image.Image") -> "Image.Image":
     w, h = img.size
-    if max(w, h) > MAX_SIDE:  # 長辺を 1568 に
+    if max(w, h) > MAX_SIDE:  # clamp the long side to 1568
         s = MAX_SIDE / max(w, h)
         img = img.resize((max(1, int(w * s)), max(1, int(h * s))), RESAMPLE)
         w, h = img.size
-    if min(w, h) < MIN_SIDE:  # 短辺を 280 以上に
+    if min(w, h) < MIN_SIDE:  # bring the short side up to 280
         s = MIN_SIDE / min(w, h)
         img = img.resize((int(w * s + 0.5), int(h * s + 0.5)), RESAMPLE)
         w, h = img.size
-    if w * h > MAX_PIXELS:  # 画素数上限
+    if w * h > MAX_PIXELS:  # total pixel cap
         s = (MAX_PIXELS / (w * h)) ** 0.5
         img = img.resize((max(1, int(w * s)), max(1, int(h * s))), RESAMPLE)
     if img.mode != "RGB":
@@ -236,7 +236,7 @@ def normalize_for_jev(img: "Image.Image") -> "Image.Image":
 
 
 # --------------------------------------------------------------------------
-# ブラウザ
+# Browser
 # --------------------------------------------------------------------------
 def find_browser() -> str | None:
     for p in BROWSER_CANDIDATES:
@@ -251,8 +251,8 @@ def find_browser() -> str | None:
 
 def launch_context(playwright, profile_dir: Path, headless: bool):
     args = [
-        "--autoplay-policy=no-user-gesture-required",  # ミュート自動再生を許可
-        "--disable-blink-features=AutomationControlled",  # 自動化検知を少し避ける
+        "--autoplay-policy=no-user-gesture-required",  # allow muted autoplay
+        "--disable-blink-features=AutomationControlled",  # slightly dodge automation detection
         "--mute-audio",
         "--no-first-run",
         "--no-default-browser-check",
@@ -268,24 +268,24 @@ def launch_context(playwright, profile_dir: Path, headless: bool):
     if exe:
         return playwright.chromium.launch_persistent_context(executable_path=exe, **kw)
     print(
-        "[warn] Brave/Chrome が見つからないため同梱 Chromium を使います。"
-        "H.264 を再生できずフレームが取れない可能性があります。",
+        "[warn] Brave/Chrome not found; falling back to the bundled Chromium. "
+        "It may be unable to decode H.264, in which case frames cannot be captured.",
         file=sys.stderr,
     )
     return playwright.chromium.launch_persistent_context(**kw)
 
 
 def resolve_cdp_endpoint(explicit: str, profile_dir: str | None) -> str:
-    """CDP のエンドポイントを決める。
+    """Resolve the CDP endpoint.
 
-    - 明示 URL（``http://`` / ``ws://``）ならそのまま使う
-    - ``auto`` なら ``DevToolsActivePort`` を探して
-      ``ws://127.0.0.1:<port><path>`` を組み立てる。
+    - An explicit URL (``http://`` / ``ws://``) is used as-is.
+    - ``auto`` looks for ``DevToolsActivePort`` and builds
+      ``ws://127.0.0.1:<port><path>`` from it.
 
-    Brave/Chrome/Edge ≧136 では既定プロファイルに ``--remote-debugging-port`` が
-    効かない。代わりに ``brave://inspect/#remote-debugging`` のトグルを ON にすると
-    Brave がプロファイル直下に ``DevToolsActivePort`` を書き、認可付きで待ち受ける
-    （HTTP の /json/version は 404 になるが、ws:// は使える）。
+    Brave/Chrome/Edge >= 136 ignore ``--remote-debugging-port`` for the default profile.
+    Turning on the ``brave://inspect/#remote-debugging`` toggle instead makes Brave
+    write ``DevToolsActivePort`` into the profile and listen with authorization
+    (HTTP /json/version returns 404 on that route, but ws:// works).
     """
     if explicit and explicit != "auto":
         return explicit
@@ -302,14 +302,14 @@ def resolve_cdp_endpoint(explicit: str, profile_dir: str | None) -> str:
             if len(lines) >= 2 and lines[0].strip():
                 return f"ws://127.0.0.1:{lines[0].strip()}{lines[1].strip()}"
     raise SystemExit(
-        "DevToolsActivePort が見つかりません。\n"
-        "Brave のアドレスバーで brave://inspect/#remote-debugging を開き、\n"
-        "「Allow remote debugging」を ON にしてください（Local State に保存され、再起動後も有効）。"
+        "DevToolsActivePort not found.\n"
+        "Open brave://inspect/#remote-debugging in Brave and turn on\n"
+        "\"Allow remote debugging\" (it is stored in Local State and survives restarts)."
     )
 
 
 def ensure_login(page, timeout_s: int = 600) -> None:
-    """ログイン済みになるまで待つ。未ログインなら人間にログインしてもらう。"""
+    """Wait until we are logged in; if not, ask the human to log in."""
     page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
     asked = False
     deadline = time.time() + timeout_s
@@ -317,14 +317,14 @@ def ensure_login(page, timeout_s: int = 600) -> None:
         if page.locator('a[href="/reels/"]').count() > 0:
             return
         if not asked:
-            print(">>> Brave の Instagram でログインしてください（完了まで待機します）", flush=True)
+            print(">>> Please log in to Instagram in Brave (waiting until it is done)", flush=True)
             asked = True
         time.sleep(3)
-    raise SystemExit("ログインを確認できませんでした")
+    raise SystemExit("could not confirm a logged-in session")
 
 
 # --------------------------------------------------------------------------
-# リール操作
+# Reel actions
 # --------------------------------------------------------------------------
 def reel_code(page) -> str:
     m = re.search(r"/reels?/([A-Za-z0-9_-]+)", page.url)
@@ -359,10 +359,10 @@ def next_reel(page, timeout_ms: int = 8000) -> None:
 
 
 def blank_range(jpeg: bytes) -> int:
-    """ほぼ真っ黒（＝デコード前）のフレームを弾くための指標。
+    """Metric used to reject near-black (not yet decoded) frames.
 
-    グレースケールのヒストグラムで「最小輝度と最大輝度の差」を返す。
-    動画のメタデータだけ読めて実フレームが未デコードだと 0 に近くなる。
+    Returns the spread between the darkest and brightest grey values. It collapses
+    toward 0 when only metadata is loaded and no real frame has been decoded.
     """
     img = Image.open(io.BytesIO(jpeg)).convert("L")
     hist = img.histogram()
@@ -372,10 +372,10 @@ def blank_range(jpeg: bytes) -> int:
 
 
 def capture_frame(page, out_dir: Path | None, tries: int = 4, min_range: int = 16) -> tuple[str, str] | None:
-    """(保存パス or '', base64 JPEG) を返す。フレームが取れなければ None。
+    """Return (saved path or '', base64 JPEG), or None when no frame could be captured.
 
-    再生直後は readyState が 4 でも実フレームが未デコードで真っ黒になることがあるため、
-    非単調なフレームが得られるまで短い間隔で撮り直す。
+    Right after playback starts, readyState can be 4 while no real frame exists yet, so
+    retry at short intervals until a non-flat frame is captured.
     """
     raw: bytes | None = None
     for attempt in range(max(1, tries)):
@@ -432,7 +432,7 @@ def close_overlays(page) -> None:
 
 
 def do_like(page) -> str:
-    if has_visible_label(page, "Unlike"):  # 既に Like 済み
+    if has_visible_label(page, "Unlike"):  # already liked
         return "already_liked"
     btn = find_visible_button(page, "Like")
     if not btn:
@@ -443,7 +443,7 @@ def do_like(page) -> str:
 
 
 def do_not_interested(page) -> str:
-    """Report -> 「I just don't like it」。Web リールには Not interested が無いため。"""
+    """Report -> "I just don't like it", because web reels have no Not interested."""
     more = find_visible_button(page, "More")
     if not more:
         return "more_button_not_found"
@@ -462,12 +462,12 @@ def do_not_interested(page) -> str:
 
 
 def do_skip(page) -> str:
-    # ネガティブ信号を一切送らない場合。滞在時間を短くするだけ。
+    # Send no negative signal at all; just keep the dwell short.
     return "skipped"
 
 
 def _to_int(t: str | None) -> int | None:
-    """'44' / '1.2K' / '3M' を整数にする。"""
+    """Turn '44' / '1.2K' / '3M' into an integer."""
     if not t:
         return None
     s = t.strip().replace(",", "")
@@ -483,7 +483,7 @@ def _to_int(t: str | None) -> int | None:
 
 
 def engagement(page) -> dict:
-    """表示中のリールのコメント数・リポスト数（いいね数は IG が出さない）。"""
+    """Comment and repost counts of the on-screen reel (IG shows no like count)."""
     try:
         raw = page.evaluate(JS_ENGAGEMENT) or {}
     except Exception:
@@ -492,9 +492,10 @@ def engagement(page) -> dict:
 
 
 def dwell_until_end(page, loops: int = 1, cap: float = 45.0) -> float:
-    """動画を最後まで見る（＋ループ）。視聴時間は最も強いポジティブ信号で、他人に通知されない。
+    """Watch the video to the end (plus optional loops). Watch time is the strongest
+    positive signal and notifies nobody.
 
-    Returns: 実際に待った秒数
+    Returns: the number of seconds actually waited
     """
     try:
         info = page.evaluate(JS_VIDEO_INFO) or {}
@@ -506,17 +507,17 @@ def dwell_until_end(page, loops: int = 1, cap: float = 45.0) -> float:
     except (TypeError, ValueError):
         dur = 0.0
     if dur <= 0 or dur > 600:
-        dur = 8.0  # 不明なら控えめに
+        dur = 8.0  # conservative fallback when unknown
     total = min(dur, cap) * (1 + max(0, loops))
     page.wait_for_timeout(int(total * 1000))
     return total
 
 
 def maybe_like(page, args) -> str:
-    """「小さい投稿だけ Like」ポリシー。
+    """The "only like small posts" policy.
 
-    IG のリールは「いいね数」を表示しないので、コメント数とリポスト数で判定する。
-    両方が閾値以下のときだけ Like する（＝目立たない投稿にだけ反応する）。
+    IG does not show a like count on reels, so we judge by comment and repost counts.
+    Only like when both are at or below their thresholds (i.e. react to unremarkable posts).
     """
     if getattr(args, "interact", "view-only") != "like":
         return "like_off"
@@ -539,19 +540,19 @@ def maybe_like(page, args) -> str:
 
 
 # --------------------------------------------------------------------------
-# 判定
+# Judging
 # --------------------------------------------------------------------------
 def build_questions(targets: str) -> list[dict]:
     qs = [
         {
             "type": "predicate",
             "name": "is_dog",
-            "instructions": "画像にはっきりと犬が写っていますか？（ぬいぐるみ・イラスト・CG は false）",
+            "instructions": "Does the image clearly show a dog? (plush toys, drawings, CGI => false)",
         },
         {
             "type": "predicate",
             "name": "is_cat",
-            "instructions": "画像にはっきりと猫が写っていますか？（ぬいぐるみ・イラスト・CG は false）",
+            "instructions": "Does the image clearly show a cat? (plush toys, drawings, CGI => false)",
         },
     ]
     if targets == "any":
@@ -559,7 +560,7 @@ def build_questions(targets: str) -> list[dict]:
             {
                 "type": "predicate",
                 "name": "is_animal",
-                "instructions": "画像の主役は実在の動物ですか？（人物・物・風景・CG キャラは false）",
+                "instructions": "Is the main subject a real animal? (people, objects, scenery, CGI => false)",
             }
         )
     return qs
@@ -587,18 +588,18 @@ def judge(
     backend: str = "jev",
     local_url: str | None = None,
 ):
-    """判定本体。backend=jev は Vercel AI Gateway、backend=local は llama.cpp。"""
+    """The judge itself. backend=jev uses Vercel AI Gateway, backend=local uses llama.cpp."""
     if backend == "local":
-        import local_judge  # 遅延 import（ローカルを使わない場合は不要）
+        import local_judge  # lazy import (unnecessary when not using the local judge)
 
         return local_judge.decide_local(
             local_url or local_judge.DEFAULT_BASE_URL, image_b64, text or "", targets
         )
 
     prompt = (
-        "Instagram のリール動画から抜き出した 1 フレームです。"
-        "キャプション等のテキストも添えます。質問に確率で答えてください。\n"
-        f"--- テキスト情報 ---\n{text or '(なし)'}"
+        "One frame extracted from an Instagram reel video."
+        "Supporting text such as the caption is included. Answer the questions with probabilities.\n"
+        f"--- text ---\n{text or '(none)'}"
     )
     resp = decide_with_images(api_key, prompt, [image_b64], questions, model=model)
     answers = parse_answers(resp)
@@ -607,7 +608,7 @@ def judge(
 
 
 # --------------------------------------------------------------------------
-# ログ
+# Logging
 # --------------------------------------------------------------------------
 class Logger:
     def __init__(self, path: Path):
@@ -626,12 +627,12 @@ class Logger:
 
 
 # --------------------------------------------------------------------------
-# メインループ
+# Main loop
 # --------------------------------------------------------------------------
 def run(args: argparse.Namespace) -> int:
     api_key = os.environ.get("AI_GATEWAY_API_KEY")
     if args.judge == "jev" and not api_key and not args.dry_run:
-        sys.exit("AI_GATEWAY_API_KEY を環境変数に設定してください（--judge local なら不要）")
+        sys.exit("set AI_GATEWAY_API_KEY in the environment (not needed for --judge local)")
 
     profile_dir = Path(args.profile).expanduser().resolve()
     frame_dir = Path(args.frames_dir).expanduser().resolve() if args.frames_dir else None
@@ -650,18 +651,18 @@ def run(args: argparse.Namespace) -> int:
         if args.cdp:
             endpoint = resolve_cdp_endpoint(args.cdp, args.cdp_profile_dir)
             print(
-                ">>> 既存ブラウザへ CDP 接続します。Brave に承認ダイアログが出たら許可してください"
+                ">>> Attaching to the running browser over CDP. Approve the dialog in Brave if it appears"
                 f"（{endpoint.split('/devtools/')[0]}/...）",
                 flush=True,
             )
             browser = p.chromium.connect_over_cdp(endpoint, timeout=180000)
-            ctx = browser.contexts[0]  # 既存プロファイルの Cookie を持つ既定コンテキスト
-            page = ctx.new_page()  # あなたの開いているタブは触らない
+            ctx = browser.contexts[0]  # the default context, which carries the real profile's cookies
+            page = ctx.new_page()  # do not touch the tabs you already have open
             attached = True
         else:
             ctx = launch_context(p, profile_dir, args.headless)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.bring_to_front()  # ← クセ1: これが無いと動画がデコードされない
+        page.bring_to_front()  # <- quirk 1: without this the video is never decoded
 
         ensure_login(page)
         page.goto("https://www.instagram.com/reels/", wait_until="domcontentloaded")
@@ -684,7 +685,7 @@ def run(args: argparse.Namespace) -> int:
 
                 frame = capture_frame(page, frame_dir)
                 if frame is None:
-                    # フレームが取れない（デコード失敗）→ 再生を促してもう一度
+                    # no frame (decode failure) -> nudge playback and try once more
                     nudge_play(page)
                     if not wait_visible_video(page, 8000):
                         stats["errors"] += 1
@@ -717,8 +718,8 @@ def run(args: argparse.Namespace) -> int:
                     print(f"[{step}] {args.judge} {time.time() - t0:.1f}s  {key}={score:.3f}", flush=True)
                     is_animal = score >= args.threshold
                     if is_animal:
-                        # ★ 最強のポジティブ信号：最後まで見る（＋ループ）。
-                        #    匿名・通知なし・自分のリストを汚さない。
+                        # * strongest positive signal: watch to the end (+ loops).
+                        #   anonymous, no notification, no polluted lists.
                         dwell_s = dwell_until_end(page, loops=args.loops, cap=args.max_dwell)
                         now = time.time()
                         like_times = [t for t in like_times if now - t < 3600]
@@ -728,9 +729,9 @@ def run(args: argparse.Namespace) -> int:
                             action = maybe_like(page, args)
                             if action == "liked":
                                 like_times.append(now)
-                        print(f"[{step}] 完走 {dwell_s:.1f}s -> {action}", flush=True)
+                        print(f"[{step}] watched {dwell_s:.1f}s -> {action}", flush=True)
                     else:
-                        # ★ 2秒未満で切る（Meta の system card が予測対象にしているネガティブ信号）
+                        # * cut within 2 seconds (a negative signal Meta's system card explicitly predicts)
                         page.wait_for_timeout(random.randint(700, 1500))
                         if args.negative == "report" and reports_done < args.max_reports:
                             action = do_not_interested(page)
@@ -774,7 +775,7 @@ def run(args: argparse.Namespace) -> int:
                 next_reel(page)
 
             except KeyboardInterrupt:
-                print("\n停止しました", flush=True)
+                print("\nstopped", flush=True)
                 break
             except JevError as e:
                 stats["errors"] += 1
@@ -782,14 +783,14 @@ def run(args: argparse.Namespace) -> int:
                 detail = str(e).split(": ", 2)[-1].strip()
                 print(f"[{step}] ✗ Jev error (HTTP {e.status}): {detail[:220]}", flush=True)
                 if not e.retryable:
-                    print("  → このモデルはこのアカウントでは使えません（無料枠の対象外）。"
-                          "AI Gateway のクレジット購入が必要です。", flush=True)
+                    print("  -> this model is unavailable on this account (not free-tier eligible). "
+                          "AI Gateway credits are required.", flush=True)
                 if consec_errors >= args.max_errors:
-                    print(f"  → 連続 {consec_errors} 回失敗したため停止します。", flush=True)
+                    print(f"  -> stopping after {consec_errors} consecutive failures", flush=True)
                     break
                 time.sleep(2)
                 try:
-                    next_reel(page)   # 同じリールで固まらないように進める
+                    next_reel(page)   # advance so we never wedge on one reel
                 except Exception:
                     pass
             except Exception as e:  # noqa: BLE001
@@ -797,7 +798,7 @@ def run(args: argparse.Namespace) -> int:
                 consec_errors += 1
                 print(f"[{step}] unexpected: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 if consec_errors >= args.max_errors:
-                    print(f"  → 連続 {consec_errors} 回失敗したため停止します。", flush=True)
+                    print(f"  -> stopping after {consec_errors} consecutive failures", flush=True)
                     break
                 time.sleep(2)
                 try:
@@ -808,7 +809,7 @@ def run(args: argparse.Namespace) -> int:
         print("=== summary:", json.dumps({**stats, "actions": actions_tally}, ensure_ascii=False), flush=True)
         logger.close()
         if attached:
-            print(">>> 既存ブラウザから切断します（ブラウザは閉じません）", flush=True)
+            print(">>> detaching from the browser (it stays open)", flush=True)
         else:
             try:
                 ctx.close()
@@ -818,41 +819,41 @@ def run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Instagram リールを Jev で判定してフィードを訓練する")
-    ap.add_argument("--profile", default=".browser-profile", help="Playwright 用プロファイル（初回だけ手動ログイン）")
+    ap = argparse.ArgumentParser(description="Judge Instagram Reels and train the feed")
+    ap.add_argument("--profile", default=".browser-profile", help="Playwright profile directory (log in once, manually)")
     ap.add_argument("--cdp", default=None, nargs="?", const="auto",
-                    help="既存ブラウザに CDP 接続（ログイン不要）。'auto' で DevToolsActivePort を自動検出、"
-                         "または ws://127.0.0.1:PORT/devtools/browser/... を直接指定")
+                    help="attach to a running browser over CDP (no login needed). 'auto' discovers "
+                         "DevToolsActivePort, or pass ws://127.0.0.1:PORT/devtools/browser/... directly")
     ap.add_argument("--cdp-profile-dir", default=None,
-                    help="DevToolsActivePort を探すプロファイルディレクトリ（既定: Brave/Chrome/Edge）")
+                    help="profile directory to search for DevToolsActivePort (default: Brave/Chrome/Edge)")
     ap.add_argument("--judge", choices=["jev", "local"], default="jev",
-                    help="判定エンジン。jev=Vercel AI Gateway の Jev（有料）、local=llama.cpp の VLM（無料・ローカル）")
+                    help="judging engine. jev = Jev on Vercel AI Gateway (paid), local = a VLM under llama.cpp (free, on-device)")
     ap.add_argument("--local-url", default=None,
-                    help="ローカル判定サーバの URL（既定 http://127.0.0.1:8081）")
-    ap.add_argument("--steps", type=int, default=0, help="処理するリール数。0 で無限ループ（既定）")
+                    help="local judge server URL (default http://127.0.0.1:8081)")
+    ap.add_argument("--steps", type=int, default=0, help="number of reels to process; 0 loops forever (default)")
     ap.add_argument("--targets", choices=["dog,cat", "any"], default="dog,cat",
-                    help="Like する対象。'any' で全動物")
-    ap.add_argument("--threshold", type=float, default=0.90, help="Like を押す確率しきい値")
+                    help="what to like; 'any' accepts every animal")
+    ap.add_argument("--threshold", type=float, default=0.90, help="probability threshold for a like")
     ap.add_argument("--negative", choices=["skip", "report"], default="skip",
-                    help="対象外のときの挙動。report = Report -> I just don't like it")
-    ap.add_argument("--max-reports", type=int, default=30, help="1 実行あたりの report 系操作の上限")
-    ap.add_argument("--max-likes-per-hour", type=int, default=120, help="1 時間あたりの Like 上限")
-    ap.add_argument("--min-delay", type=float, default=2.5, help="次リールまでの最小待機秒")
-    ap.add_argument("--max-delay", type=float, default=7.0, help="次リールまでの最大待機秒")
-    ap.add_argument("--max-errors", type=int, default=5, help="連続で Jev 呼び出しに失敗したら停止する回数")
+                    help="behaviour for non-target reels; report = Report -> I just don't like it")
+    ap.add_argument("--max-reports", type=int, default=30, help="max report-style actions per run")
+    ap.add_argument("--max-likes-per-hour", type=int, default=120, help="max likes per hour")
+    ap.add_argument("--min-delay", type=float, default=2.5, help="minimum delay before the next reel, in seconds")
+    ap.add_argument("--max-delay", type=float, default=7.0, help="maximum delay before the next reel, in seconds")
+    ap.add_argument("--max-errors", type=int, default=5, help="stop after this many consecutive judge failures")
     ap.add_argument("--interact", choices=["view-only", "like"], default="view-only",
-                    help="対象リールへの介入。view-only=視聴だけ（既定）、like=小さい投稿だけ Like")
+                    help="how to interact with target reels. view-only = just watch (default), like = like small posts only")
     ap.add_argument("--like-max-comments", type=int, default=50,
-                    help="--interact like のとき、コメント数がこれ以下なら Like 対象")
+                    help="with --interact like, like only when comments are at most this")
     ap.add_argument("--like-max-reposts", type=int, default=50,
-                    help="--interact like のとき、リポスト数がこれ以下なら Like 対象")
-    ap.add_argument("--loops", type=int, default=1, help="対象リールを何周余分に見るか（視聴時間を伸ばす）")
-    ap.add_argument("--max-dwell", type=float, default=45.0, help="1 本あたりの最大視聴秒")
-    ap.add_argument("--log", default="runs/reels.jsonl", help="JSONL ログの出力先")
-    ap.add_argument("--frames-dir", default=None, help="指定するとフレーム JPEG を保存する")
-    ap.add_argument("--dry-run", action="store_true", help="判定も操作もせずループの挙動だけ確認")
-    ap.add_argument("--probe", action="store_true", help="1 本だけ判定して結果を詳細表示")
-    ap.add_argument("--headless", action="store_true", help="ヘッドレス（非推奨: 動画がデコードされないことがある）")
+                    help="with --interact like, like only when reposts are at most this")
+    ap.add_argument("--loops", type=int, default=1, help="extra loops to watch target reels for (stretches watch time)")
+    ap.add_argument("--max-dwell", type=float, default=45.0, help="max watch seconds per reel")
+    ap.add_argument("--log", default="runs/reels.jsonl", help="JSONL log output path")
+    ap.add_argument("--frames-dir", default=None, help="save frame JPEGs when set")
+    ap.add_argument("--dry-run", action="store_true", help="dry run: exercise the loop without judging or acting")
+    ap.add_argument("--probe", action="store_true", help="judge a single reel and print the details")
+    ap.add_argument("--headless", action="store_true", help="headless (not recommended: videos may not decode)")
     return ap
 
 

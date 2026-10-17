@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# ローカルの「画像対応 Jev」を起動する（llama.cpp / Metal）。
+# Start the local "image-capable Jev" (llama.cpp / Metal).
 #
 #   ./serve_local.sh
 #
-# モデル差し替え:
+# Swap the model:
 #   MODEL_DIR=~/models/Qwen3-VL-4B-Instruct-GGUF PORT=8081 ./serve_local.sh
 #
-# 前提: llama-server（Homebrew の llama.cpp）と、GGUF + mmproj のダウンロード。
+# Requires: llama-server (Homebrew llama.cpp) and a downloaded GGUF + mmproj.
 #   huggingface-cli download Qwen/Qwen3-VL-4B-Instruct-GGUF \
 #     --include "Qwen3VL-4B-Instruct-Q4_K_M.gguf" "mmproj-Qwen3VL-4B-Instruct-F16.gguf" \
 #     --local-dir ~/models/Qwen3-VL-4B-Instruct-GGUF
@@ -19,8 +19,8 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8081}"
 CTX="${CTX:-8192}"
 
-[ -f "$MODEL_FILE" ] || { echo "モデルがありません: $MODEL_FILE" >&2; exit 1; }
-[ -f "$MMPROJ_FILE" ] || { echo "mmproj がありません: $MMPROJ_FILE" >&2; exit 1; }
+[ -f "$MODEL_FILE" ] || { echo "missing model file: $MODEL_FILE" >&2; exit 1; }
+[ -f "$MMPROJ_FILE" ] || { echo "missing mmproj: $MMPROJ_FILE" >&2; exit 1; }
 
 echo ">>> llama-server  $MODEL_FILE  (:${PORT})"
 exec llama-server \

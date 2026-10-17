@@ -1,119 +1,131 @@
 ---
 name: jev-reel-trainer
-description: Train an Instagram Reels feed toward chosen content (dogs, cats, other animals) without following, reposting, commenting, DM-ing or saving — using a local vision model as a Jev-style decision engine. Use when the user asks to make their Reels show more of a kind of video, to fill a feed with animals/dogs/cats, to crawl or seed Instagram for reels, to judge reel frames locally (llama.cpp + Qwen3-VL), to run the jev_reel_trainer crawler on their real logged-in Brave, or to rotate varied search themes (puppy → speedy cat → weird bugs) so each run surfaces different content. Also handles the Jev-compatible cloud path (Vercel AI Gateway / TypeSafe Jev) when paid credits exist.
+description: Train an Instagram Reels feed toward chosen content (dogs, cats, other animals) without following, reposting, commenting, DM-ing or saving — using a local vision model as a Jev-style decision engine, or no judge at all when a search query already guarantees the topic. Use when the user asks to make their Reels show more of a kind of video, to fill a feed with animals/dogs/cats, to crawl or seed Instagram for reels, to judge reel frames locally (llama.cpp + Qwen3-VL), to run the jev_reel_trainer crawler on their real logged-in Brave, or to rotate varied search themes (puppy → speedy cat → weird bugs) so each run surfaces different content. Also handles the Jev-compatible cloud path (Vercel AI Gateway / TypeSafe Jev) when paid credits exist.
 ---
 
 # jev-reel-trainer
 
-Instagram のリールを**あなたの代わりに視聴して**、フィードを狙った内容（犬・猫・その他の動物）に寄せるスキル。
-判定エンジンは **ローカル VLM を Jev 風に使う**（llama.cpp + Qwen3-VL、テキストを生成させず
-1 トークンの logprobs を読むだけ）ので、**無料・通信なし**で回せる。
+Watch Reels **on the user's behalf** to steer their feed toward chosen content (dogs, cats,
+other animals).
 
-リポジトリ: `~/PROJECTS/hacking/jev_reel_trainer`
+Judging is optional: a search query like `site:instagram.com reel puppy` already guarantees the
+topic (measured 12/12 on-target), so `--judge none` is the fastest, dependency-free path. Use a
+judge only for the feed loop (mixed content) and for measurement.
 
-## 核心原則（これを外すと意味がなくなる）
+Repository: `~/PROJECTS/hacking/jev_reel_trainer`
 
-1. **他人に影響する操作は一切しない。** フォロー / リポスト / コメント / DM / 共有は禁止。
-   これらは相手に通知が飛ぶか、他人の画面に出る。
-2. **保存（Save）もしない。** ユーザーの「保存済み」コレクションを汚す。
-3. **Like は「小さい投稿」だけ**（`--interact like`）。IG のリールは**いいね数を表示しない**ので、
-   コメント数とリポスト数で判定する（既定 50/50 以下）。
-4. **視聴時間が最強の信号。** Mosseri が1位に挙げた watch time は、匿名・通知なし・
-   自分のリストを汚さない。だから**対象は最後まで見て、対象外は2秒以内に切る**。
-5. **フォローしないので供給は構造化できない。** 代わりに **検索エンジンで実在のリール URL を収穫**
-   し、**投稿者プロフィールを辿って**供給を増やす（これが唯一効く入口）。
+## Core principles — breaking these defeats the point
 
-## 前提
+1. **Never perform an action that affects other people.** No follow, repost, comment, DM or
+   share. They notify someone or land on someone else's screen.
+2. **Never save.** It fills the user's saved collection.
+3. **Like only "small" posts** (`--interact like`). IG shows no like count on reels, so the gate
+   uses **comment and repost counts** (default: both ≤ 50).
+4. **Watch time is the strongest signal.** Mosseri ranks it #1, and it is anonymous, sends no
+   notification and pollutes no list. So: watch targets to the end, cut non-targets within two
+   seconds.
+5. **No follows means no structural supply.** Instead, **harvest real reel URLs from a search
+   engine** and **walk the authors' profiles** — the only entry points that actually work.
+
+## Prerequisites
 
 ```bash
 cd ~/PROJECTS/hacking/jev_reel_trainer
-./serve_local.sh          # 別ターミナル。llama-server を :8081 で起動（モデル約3.1GB常駐）
 ```
 
-- モデル: `~/models/Qwen3-VL-4B-Instruct-GGUF`（Apache-2.0）。無ければ `huggingface-cli download` で取得。
-- ブラウザ: **ユーザーの実 Brave に CDP 接続**する（`--cdp`）。事前に一度だけ
-  `brave://inspect/#remote-debugging` で「Allow remote debugging」を ON にしてもらう。
-- クラウド Jev を使う場合のみ `AI_GATEWAY_API_KEY` が必要（**無料枠対象外＝有料**）。
+- Browser: attach to the user's real Brave over CDP (`--cdp`). They must enable
+  `brave://inspect/#remote-debugging` → **Allow remote debugging** once. Each connection may show
+  an approval prompt in Brave.
+- Judge `local`: `./serve_local.sh` in another terminal, plus a downloaded Qwen3-VL-4B GGUF
+  (~3.1 GB, Apache-2.0, not committed).
+- Judge `jev`: `AI_GATEWAY_API_KEY` **and paid credits** (Jev is not free-tier eligible).
 
-## エージェントの仕事: 毎回ちがうクエリを考える
+## The agent's job: invent a different query set every run
 
-メモリー（`memory/`）に履歴があるので、**同じ検索を繰り返さないこと**が仕事の一部。
+Memory lives in `memory/`, so repeating the same searches is a mistake.
 
 ```bash
-# 1. メモリーを見る（使ったテーマ／未使用テーマ／pending／処理済みリール数）
+# 1. inspect memory (used themes, unused themes, pending, processed reels)
 ./.venv/bin/python crawl.py --plan
 
-# 2. 未使用テーマから 3〜6 個えらび、クエリを積む
-#    テーマは散らす（犬 → 猫 → 昆虫 → 水槽 …）。例:
+# 2. pick 3-6 unused themes and queue queries, spreading across categories
 ./.venv/bin/python crawl.py \
   --add-query "site:instagram.com reel corgi" \
   --add-query "site:instagram.com reel jumping spider" \
   --add-query "site:instagram.com reel axolotl"
 
-# 3. 実行（判定はローカル Jev、完走＋たまに Like）
-./.venv/bin/python crawl.py --cdp --judge local --interact like --session-minutes 20
+# 3. run it
+./.venv/bin/python crawl.py --cdp --judge none --interact like --session-minutes 20
 ```
 
-`--plan` の `unused_themes` が候補プール（犬/猫/小動物/鳥/野生/昆虫/水棲/牧場/横断 の ~55 テーマ）。
-**カテゴリをまたぐ**と、ユーザーの言う「puppy → speedy cat → weird bugs」が実現する。
+`--plan` lists `unused_themes` from a pool of ~55 spread over dogs / cats / small pets / birds /
+wildlife / insects / aquatic & reptiles / farm & large / cross-cutting. Choosing across
+categories is what produces "puppy → speedy cat → weird bugs".
 
-多様な動物を流したいときは `--targets any`（既定は `dog,cat`。`any` は犬猫以外も完走させる）。
+For a wider mix of animals use `--targets any` (default `dog,cat`).
 
-## メモリーの中身
+## Memory layout
 
-| ファイル | 役割 |
+| File | Purpose |
 |---|---|
-| `memory/queries.jsonl` | 実行済みクエリと成果（`found` / `processed` / `animal_rate_pct`） |
-| `memory/pending.txt` | 次に実行するクエリ（`--add-query` が追記、`--from-memory` が消費） |
-| `memory/seen_reels.json` | 処理済みリールの shortcode（**実行をまたいで重複を防ぐ**） |
-| `memory/runs.jsonl` | 実行ごとのサマリー（動物率・分数） |
+| `memory/queries.jsonl` | executed queries with yield (`found` / `processed` / `animal_rate_pct`) |
+| `memory/pending.txt` | queries queued for the next run (`--add-query` writes, `--from-memory` consumes) |
+| `memory/seen_reels.json` | processed reel shortcodes — **prevents duplicates across runs** |
+| `memory/runs.jsonl` | per-run summaries |
 
-履歴にあるクエリは既定でスキップされる（`--allow-repeat` で解除）。
-`memory/` は gitignore 済み。
+Queries already in history are skipped by default (`--allow-repeat` overrides). `memory/` is
+gitignored.
 
-## 実行モード
+## Modes
 
-| コマンド | 用途 |
+| Command | Use |
 |---|---|
-| `crawl.py --cdp --judge local` | **フィードに依存せず供給を作る（推奨）** |
-| `reel_trainer.py --cdp --judge local` | いまのリールフィードを回して訓練＋**効果測定** |
-| `local_judge.py --image f.jpg --context "..."` | 1 枚だけ判定して確率を見る |
+| `crawl.py --cdp --judge none` | **build supply without depending on the feed (recommended)** |
+| `crawl.py --cdp --judge local --sample-judge 10` | same, plus a 1-in-10 accuracy sample |
+| `reel_trainer.py --cdp --judge local` | scroll the current feed, train it and measure it |
+| `local_judge.py --image f.jpg --context "..."` | judge a single image and print probabilities |
 
-測定は `runs/crawl.jsonl` と `runs/reels.jsonl` の `is_animal` を見る。
-フィード側の動物率が上がっていれば効いている。
+Measure by reading `is_animal` / `watched` in `runs/crawl.jsonl` and `runs/reels.jsonl`. If the
+feed's on-target rate climbs, it is working.
 
-## 実機検証で判明した IG Web のクセ（必ず踏む）
+## Instagram web quirks you will hit (verified on a real profile)
 
-1. **背景タブだと `<video>` がデコードされない。** ページ全体のスクショはグレー一色になる。
-   `page.bring_to_front()` が必須。
-2. **動画要素をクリックするとパーマリンクに遷移し、`...` メニューが「投稿メニュー」に化ける。**
-   動画は絶対にクリックしない。前面化＋`video.muted=true; video.play()` でデコードさせる。
-3. **Web のハッシュタグページは壊れている。** `/explore/tags/<tag>/` はクリックでも直リンクでも
-   `/explore/search/keyword/?q=...` に化けて `Something went wrong`。**タグ経由の巡回は不可**。
-4. **HTTP での検索エンジン収穫は使えない。** DuckDuckGo はすぐレート制限、Bing は `site:` を無視、
-   Reddit は 403。**実ブラウザでの検索が唯一安定して動く**（Brave Search / Google はブロックされない）。
-5. **キーワード検索はアカウント名を返す**（"puppy" → DJ や人物）。内容検索には使えない。
-   `site:instagram.com reel <keyword>` のほうが有効。
-6. **Like 済みは `aria-label` が `Unlike` に変わる。** 二重押し防止と操作検証にこれを使う。
-7. **リールの `...` に「Not interested」は無い**（`Report / Go to post / Share to... / Copy link / Embed /
-   About this account` のみ）。準ネガティブは Report →「I just don't like it」（既定オフ）。
-8. **`Your Algorithm` / `Reset suggested content` はスマホ限定**（Web には無い）。
-   これらは**無料・無害・最強**なので、ユーザーにスマホで 3 タップしてもらう価値がある。
+1. **A background tab never decodes `<video>`.** Full-page screenshots are solid grey;
+   `page.bring_to_front()` is mandatory.
+2. **Clicking the video element navigates to the permalink** and turns the `...` menu into the
+   post menu. Never click the video — bring the tab forward and muted-play instead.
+3. **Tag pages are broken on the web.** `/explore/tags/<tag>/` rewrites to
+   `/explore/search/keyword/?q=...` ("Something went wrong"), clicked or direct. No hashtag crawl.
+4. **Plain-HTTP search harvesting fails.** DuckDuckGo rate-limits almost immediately, Bing ignores
+   `site:`, Reddit returns 403. The real browser is the only reliable route.
+5. **Keyword search returns accounts, not content** ("puppy" → DJs and people). Use
+   `site:instagram.com reel <keyword>` instead.
+6. **An already-liked reel flips `aria-label` to `Unlike`** — use it to avoid double taps and to
+   verify the action landed.
+7. **The web reel `...` menu has no "Not interested"** (only Report / Go to post / Share to... /
+   Copy link / Embed / About this account). The nearest negative is Report → "I just don't like
+   it" (off by default).
+8. **`Your Algorithm` and `Reset suggested content` are mobile-only** (absent from the web UI).
+   They are free, harmless and the strongest levers — worth asking the user for three taps.
 
-## 実測値（このスキルの根拠）
+## Measured numbers (the basis for this skill)
 
-| 経路 | 動物率 |
+| Path | On-target rate |
 |---|---|
-| リールフィード（技術系に偏った状態） | 0〜2% |
-| **検索エンジン由来のシード** | **100%（4/4）** |
-| ローカル Jev の判定 | 犬リールで `dog=1.00`、昆虫で `animal=0.9999`、人物・基板で `none=0.9999` |
-| 1 フレームの判定時間 | 4.6〜7.6 秒（M1 Pro / Metal、画像エンコード込み） |
+| Reel feed (tech-heavy account) | 0–2% |
+| **Search-engine seeds** | **100% (12/12)** |
+| Local judge, dog reel | `dog = 1.00` |
+| Local judge, katydid | `animal = 0.9999` |
+| Local judge, people / PCB | `none = 0.9999` |
+| Local judge latency | 4.6–7.6 s on an M1 Pro (Metal) — essentially all *prefill*, generation is 0 ms |
 
-## 注意（正直に）
+## Caveats — state these honestly
 
-- **実行中は Brave のタブが前面に出る**（デコードのため）。ブラウザを触らない時間帯に回すこと。
-- 検索エンジンへのクエリは **1 セッション 3〜6 件**まで。多用すると CAPTCHA のリスク。
-- 投稿者プロフィール巡回は `--max-profiles`（既定 40）で制限。ページ読み込みが増えるため。
-- **保証はできない。** フォローしない構成では「視聴＋たまの Like」だけなので、
-  **数日〜2週間の継続**が必要。判断は `animal_rate_pct` の推移で行う。
-- 自動操作は Instagram の利用規約に触れる可能性がある。自己責任で、レート制限を守って使うこと。
+- **Jev is not free-tier eligible.** The Hobby $5 credit does not cover `typesafe-ai/jev*`
+  (`403 no_providers_available`). No free-tier Gateway model supports vision.
+- **The browser tab is brought to the front** while running, so run it when the user is not using
+  the browser.
+- **Keep search-engine queries to 3–6 per session** and cap profile walks with `--max-profiles`.
+- **Nothing is guaranteed.** Without follows only watch time and occasional likes are sent, so
+  expect days to weeks of sessions. Judge by the `animal_rate_pct` trend, never by one run.
+- Automation may violate Instagram's terms. Use at your own risk and respect the rate limits.

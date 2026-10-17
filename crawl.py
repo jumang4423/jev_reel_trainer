@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""crawl.py — 検索エンジンで対象リールを掘り、投稿者プロフィールで増やし、完走で訓練する。
+"""crawl.py — mine target reels via a search engine, grow them through author profiles,
+and train the feed by watching to completion.
 
-`reel_trainer.py --mode feed` が「今のフィードを回す」のに対し、こちらは
-**フィードに依存せず供給を作る**モード。メモリー（memory/）を持ち、
-実行のたびに違うテーマのクエリを使える。
+Where `reel_trainer.py` scrolls the feed you already have, this mode
+**builds its own supply without depending on the feed**. It keeps memory (memory/)
+so every run can use a different set of themes.
 
-使い方（エージェントの典型フロー）:
-    ./crawl.py --plan                                  # 1. メモリーを見る（使ったテーマ・未使用テーマ）
+Typical agent flow:
+    ./crawl.py --plan                                  # 1. inspect memory (used / unused themes)
     ./crawl.py --add-query "site:instagram.com reel corgi" \
-               --add-query "site:instagram.com reel mantis"   # 2. 新しいクエリを積む
-    ./crawl.py --cdp --judge local --from-memory       # 3. 実行（判定はローカル Jev）
+               --add-query "site:instagram.com reel mantis"   # 2. queue new queries
+    ./crawl.py --cdp --from-memory                     # 3. run it
 
-他人に影響する操作（フォロー / リポスト / コメント / DM / 保存）は一切しない。
-Like は `--interact like` のときだけ、かつ **小さい投稿のみ**（コメント数・リポスト数が閾値以下）。
+No action that affects other people is ever taken (no follow / repost / comment / DM / save).
+A like happens only with `--interact like`, and only on **small posts** (comments and
+reposts below their thresholds).
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from pathlib import Path
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover
-    sys.exit("Playwright が必要です: pip install -r requirements.txt")
+    sys.exit("Playwright is required: pip install -r requirements.txt")
 
 import discover as dc
 import reel_trainer as rt
@@ -50,7 +52,7 @@ def process_reel(page, code: str, origin: str, args, stats: dict, queue: deque,
     author, caption = dc.split_author_and_caption(text)
     tags = dc.hashtags_of(text)
 
-    # ---- 判定（--judge none ならモデルを一切使わない）----
+    # ---- judging (with --judge none no model is used at all) ----
     judge_s = 0.0
     score = None
     key = "query"
@@ -59,15 +61,15 @@ def process_reel(page, code: str, origin: str, args, stats: dict, queue: deque,
     reason = "query_assumed"
 
     if args.judge == "none":
-        # 検索クエリで内容はほぼ保証されている（実測 12本すべて 100% 対象）。
-        # 必要なときだけキーワードゲートで「明らかな外れ」を弾く（無料・モデル不要）。
+        # The search query already guarantees the topic (12/12 reels measured on target).
+        # Only when needed, a keyword gate drops obvious misses (free, no model).
         if args.keyword_gate:
             blob = f"{caption} {' '.join(tags)}".lower()
             kws = [k.strip().lower() for k in args.keyword_gate.split(",") if k.strip()]
             if kws and not any(k in blob for k in kws):
                 watch = False
                 reason = "keyword_gate_miss"
-        # 測定用のサンプリング判定（これだけはモデルが要る）
+        # Sampled judging for measurement (this part does need a model)
         if watch and args.sample_judge and stats["reels"] % args.sample_judge == 0:
             frame = rt.capture_frame(page, None)
             if frame is not None:
@@ -113,7 +115,7 @@ def process_reel(page, code: str, origin: str, args, stats: dict, queue: deque,
         stats["per_query"].setdefault(origin, {"processed": 0, "animal": 0})["processed"] += 1
     if stats["reels"] % args.report_every == 0:
         rate = stats["animal"] / max(1, stats["reels"]) * 100
-        print(f"--- 進捗: {stats['reels']}本中 動物 {stats['animal']}本（{rate:.0f}%）---", flush=True)
+        print(f"--- progress: {stats['animal']}/{stats['reels']} on-target ({rate:.0f}%) ---", flush=True)
 
     rec = {
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -134,36 +136,36 @@ def process_reel(page, code: str, origin: str, args, stats: dict, queue: deque,
 def run(args: argparse.Namespace) -> int:
     mem = None if args.no_memory else Memory(Path(args.memory).expanduser().resolve())
 
-    # --- メモリー操作だけのモード ---
+    # --- memory-only modes ---
     if args.add_query:
         if mem is None:
-            sys.exit("--add-query はメモリーが必要です（--no-memory と併用不可）")
+            sys.exit("--add-query needs memory (cannot be combined with --no-memory)")
         added, skipped = mem.add_pending(args.add_query)
         for q in added:
-            print(f"  + 追加: {q}")
+            print(f"  + queued: {q}")
         for q in skipped:
-            print(f"  - 既にあるのでスキップ: {q}")
+            print(f"  - skipped, already known: {q}")
         if not args.from_memory and not args.query:
-            print(f"pending は {len(mem.pending())} 件になりました。"
-                  f"実行するには --from-memory を付けてください。")
+            print(f"pending now holds {len(mem.pending())} queries. "
+                  f"Add --from-memory to run them.")
             return 0
 
     if args.plan:
         if mem is None:
-            sys.exit("--plan はメモリーが必要です")
+            sys.exit("--plan needs memory")
         print(json.dumps(mem.report(), ensure_ascii=False, indent=2))
         return 0
 
     if args.judge == "jev" and not os.environ.get("AI_GATEWAY_API_KEY"):
-        sys.exit("--judge jev には AI_GATEWAY_API_KEY が必要です（--judge local なら不要）")
+        sys.exit("--judge jev needs AI_GATEWAY_API_KEY (not needed for --judge local)")
 
-    # --- 実行するクエリを決める ---
+    # --- decide which queries to run ---
     if args.query:
         queries = list(args.query)
     elif args.from_memory and mem is not None:
         queries = mem.consume_pending()
         if not queries:
-            print(">>> pending が空です。--add-query で積むか --query で直接指定してください。", flush=True)
+            print(">>> pending is empty. Queue queries with --add-query or pass --query.", flush=True)
             return 0
     elif mem is not None and mem.pending():
         queries = mem.consume_pending()
@@ -175,13 +177,13 @@ def run(args: argparse.Namespace) -> int:
         fresh = [q for q in queries if q not in used]
         for q in queries:
             if q in used:
-                print(f"  (履歴にあるのでスキップ: {q})", flush=True)
+                print(f"  (skipped, already in history: {q})", flush=True)
         queries = fresh
         if not queries:
-            print(">>> すべて実行済みのクエリでした。--allow-repeat か --add-query を使ってください。", flush=True)
+            print(">>> every query was already executed. Use --allow-repeat or --add-query.", flush=True)
             return 0
 
-    print(f">>> クエリ {len(queries)} 件を実行します", flush=True)
+    print(f">>> running {len(queries)} queries", flush=True)
 
     logger = rt.Logger(Path(args.log).expanduser().resolve())
     stats: dict = {"reels": 0, "animal": 0, "non_animal": 0,
@@ -196,7 +198,7 @@ def run(args: argparse.Namespace) -> int:
         attached = False
         if args.cdp is not None:
             endpoint = rt.resolve_cdp_endpoint(args.cdp, args.cdp_profile_dir)
-            print(f">>> 既存ブラウザへ接続（{endpoint.split('/devtools/')[0]}/...）", flush=True)
+            print(f">>> connecting to the running browser ({endpoint.split('/devtools/')[0]}/...)", flush=True)
             browser = p.chromium.connect_over_cdp(endpoint, timeout=180000)
             ctx = browser.contexts[0]
             page = ctx.new_page()
@@ -212,10 +214,10 @@ def run(args: argparse.Namespace) -> int:
 
         while queue:
             if args.session_minutes and (time.time() - started) / 60 >= args.session_minutes:
-                print(f">>> セッション上限 {args.session_minutes} 分に到達", flush=True)
+                print(f">>> reached the {args.session_minutes} minute session limit", flush=True)
                 break
             if args.max_reels and stats["reels"] >= args.max_reels:
-                print(f">>> --max-reels {args.max_reels} に到達", flush=True)
+                print(f">>> reached --max-reels {args.max_reels}", flush=True)
                 break
 
             kind, val, origin = queue.popleft()
@@ -223,7 +225,7 @@ def run(args: argparse.Namespace) -> int:
                 if kind == "search":
                     codes = dc.harvest_search(page, val, args.engine)
                     codes = [c for c in codes if c not in seen_codes and c not in seen_reels_before]
-                    print(f"[search] {val!r} -> {len(codes)} 件（未処理のみ）", flush=True)
+                    print(f"[search] {val!r} -> {len(codes)} new reels", flush=True)
                     stats["per_query"].setdefault(val, {"found": 0, "processed": 0, "animal": 0})["found"] = len(codes)
                     if args.query_limit:
                         codes = codes[: args.query_limit]
@@ -231,7 +233,7 @@ def run(args: argparse.Namespace) -> int:
                 elif kind == "profile":
                     codes = dc.profile_reel_codes(page, val, scrolls=args.profile_scrolls)
                     codes = [c for c in codes if c not in seen_codes and c not in seen_reels_before]
-                    print(f"[profile] @{val} -> {len(codes)} 件（未処理のみ）", flush=True)
+                    print(f"[profile] @{val} -> {len(codes)} new reels", flush=True)
                     if args.query_limit:
                         codes = codes[: args.query_limit]
                     queue.extend(("reel", c, origin) for c in codes)
@@ -242,7 +244,7 @@ def run(args: argparse.Namespace) -> int:
                     process_reel(page, val, origin, args, stats, queue, logger, seen_profiles)
                     time.sleep(random.uniform(args.min_delay, args.max_delay))
             except KeyboardInterrupt:
-                print("\n停止しました", flush=True)
+                print("\nstopped", flush=True)
                 break
             except Exception as e:  # noqa: BLE001
                 print(f"  ! {kind} {val}: {type(e).__name__}: {str(e)[:140]}", flush=True)
@@ -265,38 +267,38 @@ def run(args: argparse.Namespace) -> int:
                                      s.get("processed", 0), s.get("animal", 0))
             mem.mark_reels(sorted(seen_codes))
             mem.record_run(summary, queries)
-            print(f">>> メモリー更新: クエリ {len(stats['per_query'])} 件 / リール {len(seen_codes)} 件を記録", flush=True)
+            print(f">>> memory updated: {len(stats['per_query'])} queries / {len(seen_codes)} reels recorded", flush=True)
 
         if attached:
-            print(">>> 既存ブラウザから切断します（ブラウザは閉じません）", flush=True)
+            print(">>> detaching from the browser (it stays open)", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="検索エンジン→プロフィール巡回で対象リールを掘って訓練する")
-    ap.add_argument("--cdp", default=None, nargs="?", const="auto", help="既存ブラウザへ CDP 接続（推奨）")
+    ap = argparse.ArgumentParser(description="Mine target reels via a search engine and author profiles, then train by watching")
+    ap.add_argument("--cdp", default=None, nargs="?", const="auto", help="attach to the running browser over CDP (recommended)")
     ap.add_argument("--cdp-profile-dir", default=None)
     ap.add_argument("--profile", default=".browser-profile")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--judge", choices=["none", "jev", "local"], default="local",
-                    help="none=判定しない（検索クエリで内容が保証されるので最速・モデル不要）")
+                    help="none = do not judge (the query guarantees the topic: fastest, no model needed)")
     ap.add_argument("--local-url", default=None)
     ap.add_argument("--keyword-gate", default=None,
-                    help="--judge none のとき、キャプション/タグにこの語（カンマ区切り）が無ければ見ない")
+                    help="with --judge none, skip reels whose caption/tags lack any of these comma-separated words")
     ap.add_argument("--sample-judge", type=int, default=0,
-                    help="--judge none でも N 本に 1 本だけ判定して動物率を測る（モデルが必要）")
+                    help="with --judge none, judge 1 in N reels to measure the hit rate (needs a model)")
 
-    ap.add_argument("--memory", default="memory", help="メモリーのディレクトリ")
-    ap.add_argument("--no-memory", action="store_true", help="メモリーを使わない（重複チェックも無し）")
-    ap.add_argument("--plan", action="store_true", help="メモリーの内容を表示して終了")
-    ap.add_argument("--add-query", action="append", default=[], help="クエリを pending に積む（複数指定可）")
-    ap.add_argument("--query", action="append", default=[], help="この実行だけで使うクエリ（複数指定可）")
-    ap.add_argument("--from-memory", action="store_true", help="pending のクエリを実行する")
-    ap.add_argument("--allow-repeat", action="store_true", help="履歴にあるクエリも実行する")
-    ap.add_argument("--query-limit", type=int, default=0, help="1 クエリから拾うリール数の上限（0=無制限）")
+    ap.add_argument("--memory", default="memory", help="memory directory")
+    ap.add_argument("--no-memory", action="store_true", help="disable memory (also disables duplicate checks)")
+    ap.add_argument("--plan", action="store_true", help="print the memory contents and exit")
+    ap.add_argument("--add-query", action="append", default=[], help="queue a query in pending (repeatable)")
+    ap.add_argument("--query", action="append", default=[], help="query used only for this run (repeatable)")
+    ap.add_argument("--from-memory", action="store_true", help="run the queries queued in pending")
+    ap.add_argument("--allow-repeat", action="store_true", help="also run queries that are already in history")
+    ap.add_argument("--query-limit", type=int, default=0, help="max reels to take from one query (0 = unlimited)")
 
-    ap.add_argument("--engine", choices=["brave", "google"], default="brave", help="検索エンジン（実ブラウザで開く）")
+    ap.add_argument("--engine", choices=["brave", "google"], default="brave", help="search engine (opened in the real browser)")
     ap.add_argument("--targets", choices=["dog,cat", "any"], default="dog,cat",
-                    help="完走させる対象。多様な動物を流したいなら any")
+                    help="what to watch to completion; use any for a wider mix of animals")
     ap.add_argument("--threshold", type=float, default=0.90)
     ap.add_argument("--interact", choices=["view-only", "like"], default="view-only")
     ap.add_argument("--like-max-comments", type=int, default=50)
@@ -304,12 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--loops", type=int, default=1)
     ap.add_argument("--max-dwell", type=float, default=45.0)
     ap.add_argument("--profile-scrolls", type=int, default=3)
-    ap.add_argument("--max-profiles", type=int, default=40, help="1 セッションで巡回する投稿者の上限")
-    ap.add_argument("--max-reels", type=int, default=0, help="処理するリール上限（0=無制限）")
-    ap.add_argument("--session-minutes", type=float, default=40.0, help="セッションの上限時間（分）")
+    ap.add_argument("--max-profiles", type=int, default=40, help="max author profiles to walk per session")
+    ap.add_argument("--max-reels", type=int, default=0, help="max reels to process (0 = unlimited)")
+    ap.add_argument("--session-minutes", type=float, default=40.0, help="session time limit in minutes")
     ap.add_argument("--min-delay", type=float, default=2.5)
     ap.add_argument("--max-delay", type=float, default=7.0)
-    ap.add_argument("--report-every", type=int, default=20, help="何本ごとにヒット率を表示するか")
+    ap.add_argument("--report-every", type=int, default=20, help="print the hit rate every N reels")
     ap.add_argument("--log", default="runs/crawl.jsonl")
     return ap
 
