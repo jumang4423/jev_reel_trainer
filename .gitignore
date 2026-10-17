@@ -1,0 +1,9 @@
+.browser-profile/
+runs/
+frames/
+__pycache__/
+*.pyc
+.env
+memory/
+.venv/
+.DS_Store
